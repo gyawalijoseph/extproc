@@ -1,258 +1,117 @@
 package main
 
 import (
-	"context"
 	"io"
 	"log"
 	"net"
-	"strings"
 
+	// Import the Envoy external processor gRPC definitions
 	extproc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
-// ExtProcServer implements the ExternalProcessor gRPC service
+// ExtProcServer implements the ExternalProcessor interface that Gloo expects
 type ExtProcServer struct {
 	extproc.UnimplementedExternalProcessorServer
 }
 
-// Process handles the bidirectional stream from Envoy/Gloo
+// Process is the main function that Gloo calls for every HTTP request
+// It receives a bidirectional stream where Gloo sends request data
+// and we send back instructions on what to modify
 func (s *ExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServer) error {
-	log.Println("New extproc stream started")
+	log.Println("New HTTP request received from Gloo")
 
+	// Keep listening for messages from Gloo on this stream
 	for {
-		// Receive request from Envoy
+		// Receive the next message from Gloo (could be headers, body, etc.)
 		req, err := stream.Recv()
 		if err == io.EOF {
-			log.Println("Stream ended by client")
+			// Stream ended normally
+			log.Println("Stream ended")
 			return nil
 		}
 		if err != nil {
-			log.Printf("Error receiving request: %v", err)
-			return status.Errorf(codes.Internal, "failed to receive request: %v", err)
+			// Something went wrong
+			log.Printf("Error receiving from Gloo: %v", err)
+			return err
 		}
 
-		// We only care about request headers for this example
-		switch v := req.Request.(type) {
-		case *extproc.ProcessingRequest_RequestHeaders:
-			response := s.processRequestHeaders(v.RequestHeaders)
-			if err := stream.Send(response); err != nil {
-				log.Printf("Error sending response: %v", err)
+		// Check if this message contains request headers
+		// We only care about headers, ignore body/trailers/etc.
+		if requestHeaders, ok := req.Request.(*extproc.ProcessingRequest_RequestHeaders); ok {
+			log.Println("Processing request headers")
+
+			// Add our header and send response back to Gloo
+			response := s.addProcessedByHeader(requestHeaders.RequestHeaders)
+			err := stream.Send(response)
+			if err != nil {
+				log.Printf("Error sending response to Gloo: %v", err)
 				return err
 			}
 
-		default:
-			// For all other request types (body, trailers, response processing)
-			// just continue without modification
-			response := &extproc.ProcessingResponse{
-				Response: &extproc.ProcessingResponse_ImmediateResponse{
-					ImmediateResponse: &extproc.ImmediateResponse{
-						Status: &extproc.HttpStatus{
-							Code: extproc.StatusCode_Continue,
-						},
-					},
-				},
-			}
-			if err := stream.Send(response); err != nil {
-				log.Printf("Error sending continue response: %v", err)
-				return err
-			}
+			log.Println("Header added and response sent to Gloo")
 		}
+		// For any other message types (body, trailers, response headers, etc.)
+		// we just ignore them - Gloo will process them normally
 	}
 }
 
-// processRequestHeaders - This is where all the header manipulation happens
-func (s *ExtProcServer) processRequestHeaders(headers *extproc.HttpHeaders) *extproc.ProcessingResponse {
-	log.Println("Processing request headers")
+// addProcessedByHeader takes the incoming headers and returns instructions
+// to add our custom "x-processed-by" header
+func (s *ExtProcServer) addProcessedByHeader(headers *extproc.HttpHeaders) *extproc.ProcessingResponse {
+	log.Println("Creating header mutation to add x-processed-by header")
 
-	// List to store all header changes we want to make
-	headerMutations := []*extproc.HeaderMutation{}
-
-	// 1. ALWAYS ADD: Processing identifier header
-	headerMutations = append(headerMutations, &extproc.HeaderMutation{
+	// Create a single header mutation that tells Gloo to add our header
+	headerMutation := &extproc.HeaderMutation{
 		Action: &extproc.HeaderMutation_Append_{
 			Append: &extproc.HeaderMutation_Append{
 				Header: &extproc.HeaderValue{
-					Key:   "x-processed-by",
-					Value: "eag-extproc-service",
+					Key:   "x-processed-by", // Header name
+					Value: "eag-extproc",    // Header value
 				},
 			},
 		},
-	})
-
-	// 2. READ EXISTING HEADERS: Look through incoming headers
-	var instructionsValue string
-	var requestPath string
-	var hasAuth bool
-
-	for _, header := range headers.Headers.Headers {
-		switch strings.ToLower(header.Key) {
-		case "instructions":
-			// Special header with JSON instructions for what to do
-			instructionsValue = header.Value
-			log.Printf("Found instructions: %s", header.Value)
-
-		case ":path":
-			// The URL path being requested
-			requestPath = header.Value
-			log.Printf("Request path: %s", header.Value)
-
-		case "authorization":
-			// Auth token present
-			hasAuth = true
-			log.Printf("Authorization header found")
-		}
 	}
 
-	// 3. CONDITIONAL LOGIC: Add headers based on path
-	if strings.Contains(requestPath, "/api/v1") {
-		headerMutations = append(headerMutations, &extproc.HeaderMutation{
-			Action: &extproc.HeaderMutation_Append_{
-				Append: &extproc.HeaderMutation_Append{
-					Header: &extproc.HeaderValue{
-						Key:   "x-api-version",
-						Value: "v1",
-					},
-				},
-			},
-		})
-	}
-
-	if strings.Contains(requestPath, "/admin") {
-		headerMutations = append(headerMutations, &extproc.HeaderMutation{
-			Action: &extproc.HeaderMutation_Append_{
-				Append: &extproc.HeaderMutation_Append{
-					Header: &extproc.HeaderValue{
-						Key:   "x-admin-access",
-						Value: "true",
-					},
-				},
-			},
-		})
-	}
-
-	// 4. SECURITY CHECK: Block protected paths without auth
-	if strings.Contains(requestPath, "/protected") && !hasAuth {
-		log.Println("Blocking access to protected path - no auth header")
-		return &extproc.ProcessingResponse{
-			Response: &extproc.ProcessingResponse_ImmediateResponse{
-				ImmediateResponse: &extproc.ImmediateResponse{
-					Status: &extproc.HttpStatus{
-						Code: extproc.StatusCode_Unauthorized,
-					},
-					Headers: &extproc.HeaderMap{
-						Headers: []*extproc.HeaderValue{
-							{
-								Key:   "content-type",
-								Value: "application/json",
-							},
-						},
-					},
-					Body: `{"error": "Authorization required"}`,
-				},
-			},
-		}
-	}
-
-	// 5. DYNAMIC INSTRUCTIONS: Process the "instructions" header
-	if instructionsValue != "" {
-		dynamicMutations := s.parseInstructions(instructionsValue)
-		headerMutations = append(headerMutations, dynamicMutations...)
-	}
-
-	// 6. SEND RESPONSE: Tell Envoy/Gloo to continue with our header changes
-	log.Printf("Applying %d header mutations", len(headerMutations))
+	// Package the header mutation into a response that tells Gloo:
+	// "Continue processing this request, but first add this header"
 	return &extproc.ProcessingResponse{
 		Response: &extproc.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &extproc.HeadersResponse{
 				Response: &extproc.CommonResponse{
-					Status:         extproc.CommonResponse_CONTINUE,
-					HeaderMutation: headerMutations,
+					Status:         extproc.CommonResponse_CONTINUE,           // Keep processing the request
+					HeaderMutation: []*extproc.HeaderMutation{headerMutation}, // Add our header
 				},
 			},
 		},
 	}
 }
 
-// parseInstructions converts JSON instructions into header mutations
-// Expected format: {"addHeaders":{"key":"value"},"removeHeaders":["key1","key2"]}
-func (s *ExtProcServer) parseInstructions(instructionsJSON string) []*extproc.HeaderMutation {
-	var mutations []*extproc.HeaderMutation
-
-	log.Printf("Parsing instructions: %s", instructionsJSON)
-
-	// Simple string-based parsing (you could use proper JSON parsing here)
-
-	// ADD HEADERS: Look for "addHeaders" section
-	if strings.Contains(instructionsJSON, `"header3":"value3"`) {
-		mutations = append(mutations, &extproc.HeaderMutation{
-			Action: &extproc.HeaderMutation_Append_{
-				Append: &extproc.HeaderMutation_Append{
-					Header: &extproc.HeaderValue{
-						Key:   "header3",
-						Value: "value3",
-					},
-				},
-			},
-		})
-		log.Println("Added header3: value3")
-	}
-
-	if strings.Contains(instructionsJSON, `"header4":"value4"`) {
-		mutations = append(mutations, &extproc.HeaderMutation{
-			Action: &extproc.HeaderMutation_Append_{
-				Append: &extproc.HeaderMutation_Append{
-					Header: &extproc.HeaderValue{
-						Key:   "header4",
-						Value: "value4",
-					},
-				},
-			},
-		})
-		log.Println("Added header4: value4")
-	}
-
-	// REMOVE HEADERS: Look for "removeHeaders" section
-	if strings.Contains(instructionsJSON, `"removeHeaders"`) {
-		if strings.Contains(instructionsJSON, `"header2"`) {
-			mutations = append(mutations, &extproc.HeaderMutation{
-				Action: &extproc.HeaderMutation_Remove{
-					Remove: "header2",
-				},
-			})
-			log.Println("Removing header2")
-		}
-
-		if strings.Contains(instructionsJSON, `"instructions"`) {
-			mutations = append(mutations, &extproc.HeaderMutation{
-				Action: &extproc.HeaderMutation_Remove{
-					Remove: "instructions",
-				},
-			})
-			log.Println("Removing instructions header")
-		}
-	}
-
-	log.Printf("Generated %d mutations from instructions", len(mutations))
-	return mutations
-}
-
 func main() {
-	// Start gRPC server on port 9001
+	log.Println("Starting EAG ExtProc service...")
+
+	// Create a TCP listener on port 9001 (standard ExtProc port)
 	lis, err := net.Listen("tcp", ":9001")
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		log.Fatalf("Failed to create listener on port 9001: %v", err)
 	}
+	log.Println("Listening on port 9001")
 
-	s := grpc.NewServer()
-	extProcServer := &ExtProcServer{}
-	extproc.RegisterExternalProcessorServer(s, extProcServer)
+	// Create a new gRPC server
+	grpcServer := grpc.NewServer()
+	log.Println("gRPC server created")
 
-	log.Println("EAG ExtProc Header Manipulation Service starting on :9001")
+	// Register our ExtProc service with the gRPC server
+	// This tells gRPC that our ExtProcServer should handle ExtProc requests
+	extproc.RegisterExternalProcessorServer(grpcServer, &ExtProcServer{})
+	log.Println("ExtProc service registered")
 
-	if err := s.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve: %v", err)
+	log.Println("Service will add header: x-processed-by: eag-extproc")
+	log.Println("Ready to receive requests from Gloo Gateway...")
+
+	// Start the gRPC server and block here
+	// Gloo will connect to this server and send HTTP request data
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("Failed to start gRPC server: %v", err)
 	}
 }
