@@ -1,13 +1,20 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
+	"net/http"
 
 	// Import the Envoy external processor gRPC definitions
 	extproc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/grpc"
+
+	// Health check imports - these provide ready-to-use health check implementations
+	"github.com/solo-io/go-utils/healthchecker"             // Solo.io's health checker utility
+	grpchealth "google.golang.org/grpc/health"              // gRPC health service implementation
+	healthpb "google.golang.org/grpc/health/grpc_health_v1" // gRPC health service protocol definitions
 )
 
 // ExtProcServer implements the ExternalProcessor interface that Gloo expects
@@ -90,12 +97,28 @@ func (s *ExtProcServer) addProcessedByHeader(headers *extproc.HttpHeaders) *extp
 func main() {
 	log.Println("Starting EAG ExtProc service...")
 
+	// Start HTTP health check server in a separate goroutine
+	// This provides a simple HTTP endpoint that Kubernetes can use for health checks
+	go func() {
+		// Create HTTP server for health checks on port 8080
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("OK"))
+		})
+
+		// Start HTTP server for health checks
+		log.Println("Health check server starting on :8080/health")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Printf("Health check server failed: %v", err)
+		}
+	}()
+
 	// Create a TCP listener on port 9001 (standard ExtProc port)
 	lis, err := net.Listen("tcp", ":9001")
 	if err != nil {
 		log.Fatalf("Failed to create listener on port 9001: %v", err)
 	}
-	log.Println("Listening on port 9001")
+	log.Println("gRPC server listening on port 9001")
 
 	// Create a new gRPC server
 	grpcServer := grpc.NewServer()
@@ -106,7 +129,26 @@ func main() {
 	extproc.RegisterExternalProcessorServer(grpcServer, &ExtProcServer{})
 	log.Println("ExtProc service registered")
 
+	// Register gRPC health service - this allows gRPC health checks
+	// Kubernetes can use this to check if the gRPC service is healthy
+	healthServer := grpchealth.NewServer()
+	healthpb.RegisterHealthServer(grpcServer, healthServer)
+
+	// Set the ExtProc service as healthy
+	healthServer.SetServingStatus("envoy.service.ext_proc.v3.ExternalProcessor", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING) // Overall server health
+	log.Println("gRPC health service registered and set to SERVING")
+
+	// Start healthchecker utility (Solo.io's health checker)
+	// This provides additional health monitoring capabilities
+	hc := healthchecker.NewGrpc("ExtProc Service", grpcServer)
+	hc.StartServer(context.Background())
+	log.Println("Solo.io health checker started")
+
 	log.Println("Service will add header: x-processed-by: eag-extproc")
+	log.Println("Health check endpoints:")
+	log.Println("  - HTTP: http://localhost:8080/health")
+	log.Println("  - gRPC: grpc://localhost:9001 (health service)")
 	log.Println("Ready to receive requests from Gloo Gateway...")
 
 	// Start the gRPC server and block here
