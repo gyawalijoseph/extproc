@@ -1,17 +1,18 @@
 package main
 
 import (
-	"context"
 	"io"
 	"log"
 	"net"
 	"net/http"
 
 	// Import the Envoy external processor gRPC definitions
-	extproc "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"google.golang.org/grpc"
 
 	// Health check imports - these provide ready-to-use health check implementations
+
 	"github.com/solo-io/go-utils/healthchecker"             // Solo.io's health checker utility
 	grpchealth "google.golang.org/grpc/health"              // gRPC health service implementation
 	healthpb "google.golang.org/grpc/health/grpc_health_v1" // gRPC health service protocol definitions
@@ -19,13 +20,13 @@ import (
 
 // ExtProcServer implements the ExternalProcessor interface that Gloo expects
 type ExtProcServer struct {
-	extproc.UnimplementedExternalProcessorServer
+	extprocv3.UnimplementedExternalProcessorServer
 }
 
 // Process is the main function that Gloo calls for every HTTP request
 // It receives a bidirectional stream where Gloo sends request data
 // and we send back instructions on what to modify
-func (s *ExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServer) error {
+func (s *ExtProcServer) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
 	log.Println("New HTTP request received from Gloo")
 
 	// Keep listening for messages from Gloo on this stream
@@ -45,7 +46,7 @@ func (s *ExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServer) 
 
 		// Check if this message contains request headers
 		// We only care about headers, ignore body/trailers/etc.
-		if requestHeaders, ok := req.Request.(*extproc.ProcessingRequest_RequestHeaders); ok {
+		if requestHeaders, ok := req.Request.(*extprocv3.ProcessingRequest_RequestHeaders); ok {
 			log.Println("Processing request headers")
 
 			// Add our header and send response back to Gloo
@@ -65,32 +66,26 @@ func (s *ExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServer) 
 
 // addProcessedByHeader takes the incoming headers and returns instructions
 // to add our custom "x-processed-by" header
-func (s *ExtProcServer) addProcessedByHeader(headers *extproc.HttpHeaders) *extproc.ProcessingResponse {
+func (s *ExtProcServer) addProcessedByHeader(headers *extprocv3.HttpHeaders) *extprocv3.ProcessingResponse {
 	log.Println("Creating header mutation to add x-processed-by header")
 
-	// Create header mutation using the append action
-	appendAction := &extproc.HeaderMutation_Append_{
-		Append: &extproc.HeaderMutation_Append{
-			Header: &extproc.HeaderValue{
-				Key:   "x-processed-by", // Header name
-				Value: "eag-extproc",    // Header value
+	headerMutation := &extprocv3.HeaderMutation{
+		SetHeaders: []*corev3.HeaderValueOption{
+			{
+				Header: &corev3.HeaderValue{
+					Key:   "x-processed-by",
+					Value: "ext-proc-go-server",
+				},
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
 			},
 		},
 	}
 
-	// Create the header mutation with the action
-	headerMutation := &extproc.HeaderMutation{
-		Action: appendAction,
-	}
-
-	// Package the header mutation into a response that tells Gloo:
-	// "Continue processing this request, but first add this header"
-	return &extproc.ProcessingResponse{
-		Response: &extproc.ProcessingResponse_RequestHeaders{
-			RequestHeaders: &extproc.HeadersResponse{
-				Response: &extproc.CommonResponse{
-					Status:         extproc.CommonResponse_CONTINUE,           // Keep processing the request
-					HeaderMutation: []*extproc.HeaderMutation{headerMutation}, // Add our header
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_RequestHeaders{
+			RequestHeaders: &extprocv3.HeadersResponse{
+				Response: &extprocv3.CommonResponse{
+					HeaderMutation: headerMutation,
 				},
 			},
 		},
@@ -129,24 +124,16 @@ func main() {
 
 	// Register our ExtProc service with the gRPC server
 	// This tells gRPC that our ExtProcServer should handle ExtProc requests
-	extproc.RegisterExternalProcessorServer(grpcServer, &ExtProcServer{})
+	extprocv3.RegisterExternalProcessorServer(grpcServer, &ExtProcServer{})
 	log.Println("ExtProc service registered")
 
-	// Register gRPC health service - this allows gRPC health checks
-	// Kubernetes can use this to check if the gRPC service is healthy
+	// Set up gRPC health checking
 	healthServer := grpchealth.NewServer()
-	healthpb.RegisterHealthServer(grpcServer, healthServer)
+	hc := healthchecker.NewGrpc("ext-proc", healthServer, false, healthpb.HealthCheckResponse_SERVING)
+	// Register the health server with gRPC
+	healthpb.RegisterHealthServer(grpcServer, hc.GetServer())
 
-	// Set the ExtProc service as healthy
-	healthServer.SetServingStatus("envoy.service.ext_proc.v3.ExternalProcessor", healthpb.HealthCheckResponse_SERVING)
-	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING) // Overall server health
 	log.Println("gRPC health service registered and set to SERVING")
-
-	// Start healthchecker utility (Solo.io's health checker)
-	// This provides additional health monitoring capabilities
-	hc := healthchecker.NewGrpc("ExtProc Service", grpcServer)
-	hc.StartServer(context.Background())
-	log.Println("Solo.io health checker started")
 
 	log.Println("Service will add header: x-processed-by: eag-extproc")
 	log.Println("Health check endpoints:")
