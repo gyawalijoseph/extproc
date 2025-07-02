@@ -68,16 +68,19 @@ func (s *ExtProcServer) Process(stream extproc.ExternalProcessor_ProcessServer) 
 func (s *ExtProcServer) addProcessedByHeader(headers *extproc.HttpHeaders) *extproc.ProcessingResponse {
 	log.Println("Creating header mutation to add x-processed-by header")
 
-	// Create a single header mutation that tells Gloo to add our header
-	headerMutation := &extproc.HeaderMutation{
-		Action: &extproc.HeaderMutation_Append_{
-			Append: &extproc.HeaderMutation_Append{
-				Header: &extproc.HeaderValue{
-					Key:   "x-processed-by", // Header name
-					Value: "eag-extproc",    // Header value
-				},
+	// Create header mutation using the append action
+	appendAction := &extproc.HeaderMutation_Append_{
+		Append: &extproc.HeaderMutation_Append{
+			Header: &extproc.HeaderValue{
+				Key:   "x-processed-by", // Header name
+				Value: "eag-extproc",    // Header value
 			},
 		},
+	}
+
+	// Create the header mutation with the action
+	headerMutation := &extproc.HeaderMutation{
+		Action: appendAction,
 	}
 
 	// Package the header mutation into a response that tells Gloo:
